@@ -1,4 +1,4 @@
-let Prelude = https://prelude.dhall-lang.org/v15.0.0/package.dhall
+let Prelude = https://prelude.dhall-lang.org/package.dhall
 let Action =
 	< Copy :
 		{ src : Text
@@ -14,12 +14,11 @@ let Action =
 		}
 	>
 let Config =
-	{ actions : List Action
-	, dir : Text
+	{ name : Text
+	, actions : List Action
 	}
--- no unions
 let GoAction =
-	{ `type` : Natural
+	{ type : Natural
 	, src : Text
 	, dst : Text
 	}
@@ -28,34 +27,47 @@ let action2go
 	= \(action : Action) ->
 		merge
 		{ Copy = \(x : {dst : Text, src : Text}) ->
-			{ `type` = 0
+			{ type = 0
 			, src = x.src
 			, dst = x.dst
 			}
 		, Run = \(x : {cmd : Text, stdout : Optional Text}) ->
-			{ `type` = 1
+			{ type = 1
 			, src = x.cmd
 			, dst = Prelude.Optional.default Text "" x.stdout
 			}
 		, Env = \(x : {key : Text, val : Text}) ->
-			{ `type` = 2
+			{ type = 2
 			, src = x.key
 			, dst = x.val
 			}
 		} action
 let GoConfig =
-	{ actions : List GoAction
-	, dir : Text
+	{ name : Text
+	, actions : List GoAction
 	}
 let config2go = \(config : Config) ->
-	{ actions = Prelude.List.map Action GoAction action2go config.actions
-	, dir = config.dir
+	{ name = config.name
+	, actions = Prelude.List.map Action GoAction action2go config.actions
 	}
-in config2go
-	{ actions =
-		[ Action.Copy { src = "main.go", dst = "main.go" }
-		, Action.Run { cmd = "echo hello", stdout = Some "hello.txt" }
-		]
-	, dir = "output/hello"
-	}
+in Prelude.List.map Config GoConfig config2go
+	[
+		{ name = "hello"
+		, actions =
+			[ Action.Copy { src = "main.go", dst = "main.go" }
+			, Action.Run { cmd = "echo hello", stdout = Some "hello.txt" }
+			, Action.Run { cmd = "date", stdout = Some "date.txt" }
+			, Action.Run { cmd = "pwd", stdout = None Text}
+			, Action.Run { cmd = "rm -f output/latest", stdout = None Text}
+			, Action.Run
+				{ cmd = "echo ln -s $BUILDSYS_DIR $BUILDSYS_PARENT_DIR/latest"
+				, stdout = None Text
+				}
+			, Action.Run
+				{ cmd = "ln -s $BUILDSYS_DIR $BUILDSYS_PARENT_DIR/latest"
+				, stdout = None Text
+				}
+			]
+		}
+	]
 

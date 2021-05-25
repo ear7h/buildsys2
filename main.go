@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -21,8 +22,8 @@ var dhallFile string
 var scriptFile string
 
 type Config struct {
+	Name     string   `json:"name"`
 	Actions []Action `json:"actions"`
-	Dir     string   `json:"dir"`
 }
 
 type ActionType int
@@ -55,12 +56,17 @@ func (act *Action) DstEmpty() bool {
 	return act.Dst == ""
 }
 
-func (act *Action) Execute(dest string) error {
-	var err error
-	dest, err = filepath.Abs(dest)
-	if err != nil {
-		return err
+type ExecEnv struct {
+	Dir, ParentDir string
+}
+func (env *ExecEnv) ToSlice() []string {
+	return []string{
+		"BUILDSYS_DIR=" + env.Dir,
+		"BUILDSYS_PARENT_DIR=" + env.ParentDir,
 	}
+}
+
+func (act *Action) Execute(env ExecEnv) error {
 
 	switch act.Type {
 	case ActionCopy:
@@ -72,7 +78,7 @@ func (act *Action) Execute(dest string) error {
 			return fmt.Errorf("copy destination not relative %s", act.Dst)
 		}
 
-		act.Src = fmt.Sprintf("cp %s %s", act.Src, filepath.Join(dest, act.Dst))
+		act.Src = fmt.Sprintf("cp %s %s", act.Src, filepath.Join(env.Dir, act.Dst))
 		act.Dst = ""
 		fallthrough
 
@@ -80,13 +86,13 @@ func (act *Action) Execute(dest string) error {
 		fmt.Println(act.Src)
 
 		cmd := exec.Command("bash", "-c", act.Src)
-		cmd.Env = []string{"BUILDSYS_DIR=" + dest}
+		cmd.Env = env.ToSlice()
 		if act.DstEmpty() {
 			cmd.Stdout = os.Stdout
 		} else {
 			var err error
 			cmd.Stdout, err = os.OpenFile(
-				filepath.Join(dest, act.Dst),
+				filepath.Join(env.Dir, act.Dst),
 				os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
 				0644)
 			if err != nil {
@@ -107,13 +113,19 @@ func (act *Action) Execute(dest string) error {
 var (
 	flagConfig = flag.String("config", "-",
 		"where to read the configuration file")
+	flagParentDir = flag.String("parent-dir", "output",
+		"the parent directory of the build(s)")
 	flagNumber = flag.Bool("number", true,
 		"append a '-' and a number when the output directory matches")
 	flagDhall = flag.Bool("dhall", false,
 		"print an example dhall file")
 	flagScript = flag.Bool("script", false,
 		"print an example script")
+	flagDry = flag.Bool("dry-run", false,
+		"print actions but don't run")
 )
+
+var nameVerifyRegex = regexp.MustCompile("^[a-zA-Z\\-0-9]+$")
 
 func exitError(msg string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, msg, args...)
@@ -122,6 +134,7 @@ func exitError(msg string, args ...interface{}) {
 
 func main() {
 	flag.Parse()
+
 
 	if *flagDhall {
 		_, err := io.Copy(os.Stdout, strings.NewReader(dhallFile))
@@ -139,6 +152,12 @@ func main() {
 		return
 	}
 
+	var err error
+	*flagParentDir, err = filepath.Abs(*flagParentDir)
+	if err != nil {
+		exitError("couldn't make parent-dir absolute: %v", err)
+	}
+
 	var configFile io.Reader
 	if *flagConfig == "-" {
 		configFile = os.Stdin
@@ -146,60 +165,86 @@ func main() {
 		exitError("empty config\n")
 	}
 
-	var config Config
+	var configs []Config
 
-	err := json.NewDecoder(configFile).Decode(&config)
+	err = json.NewDecoder(configFile).Decode(&configs)
 	if err != nil {
 		exitError("could not parse config: %v\n", err)
 	}
 
-	dir := config.Dir
-	err = os.Mkdir(dir, 0755)
-	if err != nil {
-		if !os.IsExist(err) || !*flagNumber {
-			exitError("could not make output dir %s: %v\n", dir, err)
+	for _, config := range configs {
+		if !nameVerifyRegex.MatchString(config.Name) {
+			exitError("invalid name %q\n", config.Name)
 		}
 
-		// IsExist error AND we can number it
-		dirUp := filepath.Dir(dir)
-		dirBase := filepath.Base(dir)
-		patPrefix := dirBase + "-"
-		matches, err := fs.Glob(os.DirFS(dirUp), patPrefix+"*")
+		for _, v := range flag.Args() {
+			if v == config.Name {
+				goto Ok
+			}
+		}
+		continue
+
+		Ok:
+
+		env := ExecEnv {
+			Dir : filepath.Join(*flagParentDir, config.Name),
+			ParentDir : *flagParentDir,
+		}
+		fmt.Println("env: ", env)
+
+		if *flagDry {
+			for _, v := range config.Actions {
+				fmt.Println(v)
+			}
+			continue
+		}
+
+
+		err = os.Mkdir(env.Dir, 0755)
 		if err != nil {
-			exitError("could not number directory: %v", err)
-		}
+			if !os.IsExist(err) || !*flagNumber {
+				exitError("could not make output dir %s: %v\n", env.Dir, err)
+			}
 
-		max := 1
-		for _, v := range matches {
-			n, _ := strconv.Atoi(v[len(patPrefix):])
-			if n > max {
-				max = n
+			// IsExist error AND we can number it
+			patPrefix := config.Name + "-"
+			matches, err := fs.Glob(os.DirFS(*flagParentDir), patPrefix+"*")
+			if err != nil {
+				exitError("could not number directory: %v", err)
+			}
+
+			max := 1
+			for _, v := range matches {
+				n, _ := strconv.Atoi(v[len(patPrefix):])
+				if n > max {
+					max = n
+				}
+			}
+
+			max++
+
+			env.Dir = env.Dir + "-" + strconv.Itoa(max)
+			err = os.Mkdir(env.Dir, 0755)
+			if err != nil {
+				exitError("could not make numbered directory: %v", err)
 			}
 		}
 
-		max++
+		fmt.Println("writing to dir", env.Dir)
 
-		dir = dir + "-" + strconv.Itoa(max)
-		err = os.Mkdir(dir, 0755)
-		if err != nil {
-			exitError("could not make numbered directory: %v", err)
-		}
-	}
+		for i, v := range config.Actions {
+			err = v.Execute(env)
+			if err != nil {
+				var name interface{}
 
-	fmt.Println("writing to dir", dir)
+				if v.Name != "" {
+					name = v.Name
+				} else {
+					name = i
+				}
 
-	for i, v := range config.Actions {
-		err = v.Execute(dir)
-		if err != nil {
-			var name interface{}
-
-			if v.Name != "" {
-				name = v.Name
-			} else {
-				name = i
+				exitError("error executing action %v: %v\n", name, err)
 			}
-
-			exitError("error executing action %v: %v\n", name, err)
 		}
 	}
 }
